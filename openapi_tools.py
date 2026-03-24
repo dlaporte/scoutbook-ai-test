@@ -135,20 +135,20 @@ def _build_docstring(op: dict, path: str, method: str, params: list, body_props:
     return "\n".join(parts)
 
 
-def _openapi_type_to_python(schema: dict) -> str:
-    """Map an OpenAPI schema type to a Python type annotation string."""
+def _openapi_type_to_python(schema: dict) -> type:
+    """Map an OpenAPI schema type to an actual Python type."""
     t = schema.get("type", "string")
     if t == "integer":
-        return "int"
+        return int
     if t == "number":
-        return "float"
+        return float
     if t == "boolean":
-        return "bool"
+        return bool
     if t == "array":
-        return "list"
+        return list
     if t == "object":
-        return "dict"
-    return "str"
+        return dict
+    return str
 
 
 def _make_tool_func(path: str, method: str, op: dict):
@@ -200,7 +200,7 @@ def _make_tool_func(path: str, method: str, op: dict):
         py_type = _openapi_type_to_python(p.get("schema", {}))
         sig_params.append(
             inspect.Parameter(name, inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                              default="" if py_type == "str" else 0,
+                              default="" if py_type is str else 0,
                               annotation=py_type)
         )
 
@@ -281,8 +281,16 @@ def _make_tool_func(path: str, method: str, op: dict):
         )
         return json.dumps(result)
 
-    # Apply the proper signature so FastMCP can introspect parameters
+    # Apply the proper signature and annotations so FastMCP/Pydantic can
+    # introspect parameters. Pydantic uses get_type_hints() which reads
+    # __annotations__, not __signature__, so we must set both.
     tool_func_impl.__signature__ = inspect.Signature(sig_params)
+    tool_func_impl.__annotations__ = {
+        p.name: p.annotation
+        for p in sig_params
+        if p.annotation is not inspect.Parameter.empty
+    }
+    tool_func_impl.__annotations__["return"] = str
     tool_func_impl.__doc__ = docstring
     return tool_func_impl
 
