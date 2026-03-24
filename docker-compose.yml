@@ -1,0 +1,21 @@
+services:
+  mcp:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - MCP_BASE_URL=${MCP_BASE_URL:?Set MCP_BASE_URL in .env}
+      - FASTMCP_STATELESS_HTTP=true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('localhost',8000),timeout=3); s.close()"]
+      interval: 10s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    expose:
+      - "8000"
+    volumes:
+      - mcp-data:/data
+
+volumes:
+  mcp-data:
