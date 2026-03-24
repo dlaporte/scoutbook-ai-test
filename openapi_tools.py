@@ -6,10 +6,13 @@ fields as function arguments, with docstrings pulled from the OpenAPI
 descriptions.
 """
 
+import inspect
 import json
 import logging
 import re
+import textwrap
 from pathlib import Path
+from typing import Optional
 
 import yaml
 
@@ -132,75 +135,137 @@ def _build_docstring(op: dict, path: str, method: str, params: list, body_props:
     return "\n".join(parts)
 
 
+def _openapi_type_to_python(schema: dict) -> str:
+    """Map an OpenAPI schema type to a Python type annotation string."""
+    t = schema.get("type", "string")
+    if t == "integer":
+        return "int"
+    if t == "number":
+        return "float"
+    if t == "boolean":
+        return "bool"
+    if t == "array":
+        return "list"
+    if t == "object":
+        return "dict"
+    return "str"
+
+
 def _make_tool_func(path: str, method: str, op: dict):
-    """Create an async function that calls the BSA API for this endpoint."""
+    """Create an async function with explicit named parameters for this endpoint.
+
+    FastMCP requires explicit parameter signatures (no **kwargs), so we
+    use inspect.Parameter to build a proper function signature dynamically.
+    """
     params = op.get("parameters", [])
 
     # Extract request body properties
     body_schema = None
     body_props = {}
-    body_required_fields = []
     request_body = op.get("requestBody", {})
     if request_body:
         content = request_body.get("content", {})
         json_content = content.get("application/json", {})
+        if not json_content:
+            json_content = content.get("application/x-www-form-urlencoded", {})
         body_schema = json_content.get("schema", {})
         if body_schema.get("type") == "object":
             body_props = body_schema.get("properties", {})
-            body_required_fields = body_schema.get("required", [])
         elif body_schema.get("type") == "array":
-            # For array request bodies (like empty []), we'll handle specially
-            body_props = {"_request_body": body_schema}
+            body_props = {}
 
-    # Separate path params from query params
     path_params = [p for p in params if p.get("in") == "path"]
     query_params = [p for p in params if p.get("in") == "query"]
 
     docstring = _build_docstring(op, path, method, params, body_props if body_props else None)
 
-    # Build the function signature dynamically
-    # All parameters become keyword arguments
-    all_param_names = []
+    has_array_body = (body_schema is not None and body_schema.get("type") == "array")
+
+    # Collect all parameter names in order, tracking their roles
+    seen_names = set()
+    path_param_names = []
+    query_param_names = []
+    body_param_names = []
+
+    # Also build inspect.Parameter list for the signature
+    sig_params = []
+    type_hints = {}
+
     for p in path_params:
-        all_param_names.append(p["name"])
+        name = p["name"]
+        if name in seen_names:
+            continue
+        seen_names.add(name)
+        path_param_names.append(name)
+        py_type = _openapi_type_to_python(p.get("schema", {}))
+        sig_params.append(
+            inspect.Parameter(name, inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                              default="" if py_type == "str" else 0,
+                              annotation=py_type)
+        )
+
     for p in query_params:
-        all_param_names.append(p["name"])
-    for name in body_props:
-        if name != "_request_body":
-            all_param_names.append(name)
+        name = p["name"]
+        if name in seen_names:
+            continue
+        seen_names.add(name)
+        query_param_names.append(name)
+        sig_params.append(
+            inspect.Parameter(name, inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                              default=None)
+        )
 
-    # We need to handle the case where body is a plain array
-    has_array_body = (body_schema and body_schema.get("type") == "array"
-                      and "_request_body" in body_props)
+    for name, schema in body_props.items():
+        if name in seen_names:
+            continue
+        seen_names.add(name)
+        body_param_names.append(name)
+        sig_params.append(
+            inspect.Parameter(name, inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                              default=None)
+        )
 
-    async def tool_func(**kwargs) -> str:
+    # Capture these in closure for the inner function
+    _path = path
+    _method = method.upper()
+    _path_param_names = path_param_names
+    _query_param_names = query_param_names
+    _body_param_names = body_param_names
+    _has_array_body = has_array_body
+
+    async def tool_func_impl(*args, **kwargs):
+        # Bind args to parameter names
+        bound = {}
+        for i, p in enumerate(sig_params):
+            if i < len(args):
+                bound[p.name] = args[i]
+            elif p.name in kwargs:
+                bound[p.name] = kwargs[p.name]
+            else:
+                bound[p.name] = p.default
+
         auth = get_auth()
 
-        # Build the actual path with substituted parameters
-        actual_path = path
-        for p in path_params:
-            name = p["name"]
-            value = kwargs.get(name, "")
+        actual_path = _path
+        for name in _path_param_names:
+            value = bound.get(name, "")
             if not value:
                 return json.dumps({"error": f"Missing required path parameter: {name}"})
             actual_path = actual_path.replace(f"{{{name}}}", str(value))
 
-        # Build query params
         qparams = {}
-        for p in query_params:
-            name = p["name"]
-            value = kwargs.get(name)
+        for name in _query_param_names:
+            value = bound.get(name)
             if value is not None and value != "":
                 qparams[name] = str(value)
 
-        # Build request body
         body = None
-        if has_array_body:
+        if _has_array_body:
             body = []
-        elif body_props and "_request_body" not in body_props:
+        elif _body_param_names:
             body = {}
-            for name in body_props:
-                value = kwargs.get(name)
+            for name in _body_param_names:
+                value = bound.get(name)
                 if value is not None:
                     body[name] = value
             if not body:
@@ -209,15 +274,17 @@ def _make_tool_func(path: str, method: str, op: dict):
         result = await api_request(
             endpoint=actual_path,
             token=auth["token"],
-            method=method.upper(),
+            method=_method,
             params=qparams if qparams else None,
             body=body,
             cache_ttl=120,
         )
         return json.dumps(result)
 
-    tool_func.__doc__ = docstring
-    return tool_func
+    # Apply the proper signature so FastMCP can introspect parameters
+    tool_func_impl.__signature__ = inspect.Signature(sig_params)
+    tool_func_impl.__doc__ = docstring
+    return tool_func_impl
 
 
 def register_openapi_tools(mcp) -> int:
